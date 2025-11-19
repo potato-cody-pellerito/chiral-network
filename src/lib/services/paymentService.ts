@@ -11,7 +11,7 @@
 import { wallet, transactions, type Transaction } from "$lib/stores";
 import { get } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
-import { walletService } from "$lib/wallet";
+import { reputationService } from './reputationService';
 
 // type FullNetworkStats = {
 //   network_difficulty: number
@@ -38,7 +38,9 @@ function saveWalletToStorage(walletData: any) {
 
 function saveTransactionsToStorage(txs: Transaction[]) {
   try {
-    localStorage.setItem("chiral_transactions", JSON.stringify(txs));
+    const serialized = JSON.stringify(txs);
+    localStorage.setItem("chiral_transactions", serialized);
+    console.log(`💾 Saved ${txs.length} transactions to localStorage (${(serialized.length / 1024).toFixed(2)} KB)`);
   } catch (error) {
     console.error("Failed to save transactions to localStorage:", error);
   }
@@ -57,14 +59,20 @@ function loadWalletFromStorage() {
 function loadTransactionsFromStorage(): Transaction[] {
   try {
     const saved = localStorage.getItem("chiral_transactions");
-    if (!saved) return [];
+    if (!saved) {
+      console.log("📭 No transactions found in localStorage");
+      return [];
+    }
 
     const parsed = JSON.parse(saved);
     // Convert date strings back to Date objects
-    return parsed.map((tx: any) => ({
+    const transactions = parsed.map((tx: any) => ({
       ...tx,
       date: new Date(tx.date),
     }));
+    
+    console.log(`📬 Loaded ${transactions.length} transactions from localStorage`);
+    return transactions;
   } catch (error) {
     console.error("Failed to load transactions from localStorage:", error);
     return [];
@@ -95,7 +103,6 @@ export class PaymentService {
   static initialize() {
     // Only initialize once
     if (this.initialized) {
-      console.log("💾 Payment service already initialized, skipping...");
       return;
     }
 
@@ -131,12 +138,21 @@ export class PaymentService {
 
     const sizeInMB = fileSizeInBytes / (1024 * 1024);
     const cost = sizeInMB * dynamicPricePerMb;
+    
+    // Ensure minimum cost of 0.0001 Chiral for any file download
+    const minimumCost = 0.0001;
+    const finalCost = Math.max(cost, minimumCost);
 
-    console.log(
-      `💰 File size ${sizeInMB.toFixed(3)} MB @ ${dynamicPricePerMb} = ${cost}`
-    );
+    console.log(`📊 Download cost calculation:`, {
+      fileSizeBytes: fileSizeInBytes,
+      fileSizeMB: sizeInMB.toFixed(4),
+      pricePerMB: dynamicPricePerMb.toFixed(8),
+      calculatedCost: cost.toFixed(8),
+      minimumCost: minimumCost.toFixed(8),
+      finalCost: finalCost.toFixed(8)
+    });
 
-    return parseFloat(cost.toFixed(8));
+    return parseFloat(finalCost.toFixed(8));
   }
 
   /**
@@ -158,7 +174,18 @@ export class PaymentService {
         active_miners,
         power_usage,
       } = stats;
-      if (network_hashrate <= 0) return 0;
+
+      console.log(`📈 Network stats for pricing:`, {
+        difficulty: network_difficulty,
+        hashrate: network_hashrate,
+        miners: active_miners,
+        power: power_usage
+      });
+
+      if (network_hashrate <= 0) {
+        console.warn("⚠️ Network hashrate is 0, using fallback price");
+        return 0.001;
+      }
 
       // --- Average hash power per miner ---
       const avgHashPower =
@@ -174,17 +201,7 @@ export class PaymentService {
         network_difficulty *
         normalizationFactor;
 
-      console.log("📊 Dynamic pricing inputs:", {
-        difficulty: network_difficulty,
-        hashrate: network_hashrate,
-        active_miners,
-        power_usage,
-        avgHashPower,
-        baseHashCost,
-        normalizationFactor,
-        pricePerMB,
-      });
-
+      console.log(`💵 Calculated price per MB: ${pricePerMB.toFixed(8)}`);
       return parseFloat(pricePerMB.toFixed(8));
     } catch (error) {
       console.warn("⚠️ Failed to fetch dynamic pricing from network:", error);
@@ -355,8 +372,47 @@ export class PaymentService {
       this.processedPayments.add(fileHash);
       console.log("✅ Marked file as paid:", fileHash);
 
+      // Publish reputation verdict for successful payment (downloader perspective)
+      // Get our own peer ID first for the issuer_id
+      let downloaderPeerId = currentWallet.address; // Fallback to wallet address
+      try {
+        downloaderPeerId = await invoke<string>('get_peer_id');
+        console.log("📊 Got downloader peer ID:", downloaderPeerId);
+      } catch (err) {
+        console.warn("Could not get peer ID for issuer_id, using wallet address:", err);
+      }
+
+      // Publish reputation verdict using signed message system (see docs/SIGNED_TRANSACTION_MESSAGES.md)
+      try {
+        console.log("📊 Attempting to publish reputation verdict for downloader→seeder");
+        console.log("📊 seederPeerId:", seederPeerId);
+        console.log("📊 seederAddress:", seederAddress);
+        console.log("📊 Using target_id:", seederPeerId || seederAddress);
+        console.log("📊 Using issuer_id:", downloaderPeerId);
+        
+        await reputationService.publishVerdict({
+          target_id: seederPeerId || seederAddress,
+          tx_hash: transactionHash,
+          outcome: 'good',
+          details: `Successful payment for file: ${fileName}`,
+          metric: 'transaction',
+          issued_at: Math.floor(Date.now() / 1000),
+          issuer_id: downloaderPeerId,
+          issuer_seq_no: transactionId,
+        });
+        
+        console.log("✅ Published good reputation verdict for seeder:", seederPeerId || seederAddress);
+      } catch (reputationError) {
+        console.error("❌ Failed to publish reputation verdict:", reputationError);
+        // Don't fail the payment if reputation update fails
+      }
+
       // Notify backend about the payment - this will send P2P message to the seeder
       try {
+        console.log("📤 Sending payment notification with downloaderPeerId:", downloaderPeerId);
+        console.log("📤 Type of downloaderPeerId:", typeof downloaderPeerId);
+        console.log("📤 Is downloaderPeerId a peer ID?", downloaderPeerId?.startsWith('12D3Koo'));
+        
         await invoke("record_download_payment", {
           fileHash,
           fileName,
@@ -364,6 +420,7 @@ export class PaymentService {
           seederWalletAddress: seederAddress,
           seederPeerId: seederPeerId || seederAddress, // Fallback to wallet address if no peer ID
           downloaderAddress: currentWallet.address || "unknown",
+          downloaderPeerId,
           amount,
           transactionId,
           transactionHash,
@@ -398,6 +455,7 @@ export class PaymentService {
     fileName: string,
     fileSize: number,
     downloaderAddress: string,
+    downloaderPeerId: string,
     transactionHash?: string
   ): Promise<{ success: boolean; transactionId?: number; error?: string }> {
     try {
@@ -446,35 +504,64 @@ export class PaymentService {
       });
 
       // Trigger wallet refresh to recalculate balance from transaction history
-      // This ensures consistency with walletService polling
-      try {
-        await walletService.refreshBalance();
-      } catch (error) {
-        console.warn("Failed to refresh balance after payment:", error);
-        // Fallback: manually calculate balance for immediate UI feedback
-        wallet.update((w) => {
-          const allTxs = get(transactions);
-          const totalReceived = allTxs
-            .filter((tx) => tx.status === "success" && tx.type === "received")
-            .reduce((sum, tx) => sum + tx.amount, 0);
-          const totalSpent = allTxs
-            .filter((tx) => tx.status === "success" && tx.type === "sent")
-            .reduce((sum, tx) => sum + tx.amount, 0);
+      // Manually calculate balance for immediate UI feedback
+      wallet.update((w) => {
+        const allTxs = get(transactions);
+        const totalReceived = allTxs
+          .filter((tx) => tx.status === "success" && tx.type === "received")
+          .reduce((sum, tx) => sum + tx.amount, 0);
+        const totalSpent = allTxs
+          .filter((tx) => tx.status === "success" && tx.type === "sent")
+          .reduce((sum, tx) => sum + tx.amount, 0);
 
-          const updated = {
-            ...w,
-            balance: parseFloat((totalReceived - totalSpent).toFixed(8)),
-            totalEarned: totalReceived,
-            totalSpent: totalSpent,
-          };
-          saveWalletToStorage(updated);
-          return updated;
-        });
-      }
+        const updated = {
+          ...w,
+          balance: parseFloat((totalReceived - totalSpent).toFixed(8)),
+          totalEarned: totalReceived,
+          totalSpent: totalSpent,
+        };
+        saveWalletToStorage(updated);
+        return updated;
+      });
 
       // Mark this payment as received
       this.receivedPayments.add(paymentKey);
       console.log("✅ Marked payment as received:", paymentKey);
+
+      // Publish reputation verdict for successful payment (seeder perspective)
+      // Get our own peer ID first for the issuer_id
+      let seederPeerId = currentWallet.address; // Fallback to wallet address
+      try {
+        seederPeerId = await invoke<string>('get_peer_id');
+        console.log("📊 Got seeder peer ID:", seederPeerId);
+      } catch (err) {
+        console.warn("Could not get peer ID for issuer_id, using wallet address:", err);
+      }
+
+      // Publish reputation verdict using signed message system (see docs/SIGNED_TRANSACTION_MESSAGES.md)
+      try {
+        console.log("📊 Attempting to publish reputation verdict for seeder→downloader");
+        console.log("📊 downloaderPeerId:", downloaderPeerId);
+        console.log("📊 downloaderAddress:", downloaderAddress);
+        console.log("📊 Using target_id:", downloaderPeerId || downloaderAddress);
+        console.log("📊 Using issuer_id:", seederPeerId);
+        
+        await reputationService.publishVerdict({
+          target_id: downloaderPeerId || downloaderAddress,
+          tx_hash: transactionHash || null,
+          outcome: 'good',
+          details: `Payment received for file: ${fileName}`,
+          metric: 'transaction',
+          issued_at: Math.floor(Date.now() / 1000),
+          issuer_id: seederPeerId,
+          issuer_seq_no: transactionId,
+        });
+        
+        console.log("✅ Published good reputation verdict for downloader:", downloaderPeerId || downloaderAddress);
+      } catch (reputationError) {
+        console.error("❌ Failed to publish reputation verdict:", reputationError);
+        // Don't fail the payment if reputation update fails
+      }
 
       // Notify backend about the payment receipt
       try {

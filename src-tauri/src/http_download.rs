@@ -78,6 +78,8 @@ pub struct HttpDownloadClient {
     http_client: Client,
     /// Semaphore to limit concurrent chunk downloads
     download_semaphore: std::sync::Arc<Semaphore>,
+    /// Downloader's peer ID to send to provider for metrics tracking
+    downloader_peer_id: Option<String>,
 }
 
 impl HttpDownloadClient {
@@ -88,6 +90,19 @@ impl HttpDownloadClient {
                 .build()
                 .expect("Failed to create HTTP client"),
             download_semaphore: std::sync::Arc::new(Semaphore::new(MAX_CONCURRENT_CHUNKS)),
+            downloader_peer_id: None,
+        }
+    }
+
+    /// Create with downloader peer ID for provider-side metrics tracking
+    pub fn new_with_peer_id(downloader_peer_id: Option<String>) -> Self {
+        Self {
+            http_client: Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("Failed to create HTTP client"),
+            download_semaphore: std::sync::Arc::new(Semaphore::new(MAX_CONCURRENT_CHUNKS)),
+            downloader_peer_id,
         }
     }
 
@@ -99,6 +114,7 @@ impl HttpDownloadClient {
                 .build()
                 .expect("Failed to create HTTP client"),
             download_semaphore: std::sync::Arc::new(Semaphore::new(MAX_CONCURRENT_CHUNKS)),
+            downloader_peer_id: None,
         }
     }
 
@@ -223,7 +239,7 @@ impl HttpDownloadClient {
         Ok(())
     }
 
-    /// Fetch file metadata from HTTP seeder
+    /// Fetch file metadata from seeder
     ///
     /// Calls: GET /files/{file_hash}/metadata
     async fn fetch_metadata(
@@ -233,27 +249,44 @@ impl HttpDownloadClient {
     ) -> Result<HttpFileMetadata, String> {
         let url = format!("{}/files/{}/metadata", seeder_url, file_hash);
 
-        tracing::debug!("Fetching metadata from: {}", url);
+        tracing::info!("Fetching metadata from: {}", url);
 
-        let response = self
-            .http_client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to fetch metadata: {}", e))?;
+        // Build request with optional peer ID header
+        let mut request = self.http_client.get(&url);
+        
+        if let Some(ref peer_id) = self.downloader_peer_id {
+            request = request.header("X-Downloader-Peer-ID", peer_id);
+            tracing::debug!("📤 Adding downloader peer ID header: {}", peer_id);
+        }
+
+        let response = request.send().await.map_err(|e| {
+            let err_msg = format!("Failed to fetch metadata from {}: {}", url, e);
+            tracing::error!("{}", err_msg);
+            err_msg
+        })?;
 
         if !response.status().is_success() {
-            return Err(format!(
+            let err_msg = format!(
                 "Metadata request failed: {} ({})",
                 response.status(),
                 url
-            ));
+            );
+            tracing::error!("{}", err_msg);
+            return Err(err_msg);
         }
 
-        let metadata: HttpFileMetadata = response
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse metadata: {}", e))?;
+        let metadata: HttpFileMetadata = response.json().await.map_err(|e| {
+            let err_msg = format!("Failed to parse metadata from {}: {}", url, e);
+            tracing::error!("{}", err_msg);
+            err_msg
+        })?;
+
+        tracing::info!(
+            "Successfully fetched metadata: {} (size: {}, encrypted: {})",
+            metadata.name,
+            metadata.size,
+            metadata.encrypted
+        );
 
         Ok(metadata)
     }
@@ -317,6 +350,7 @@ impl HttpDownloadClient {
             let file_hash = file_hash.to_string();
             let total_chunks = ranges.len();
             let semaphore = self.download_semaphore.clone();
+            let downloader_peer_id = self.downloader_peer_id.clone();
 
             // Spawn task for each chunk (but semaphore limits concurrency)
             let task = tokio::spawn(async move {
@@ -334,13 +368,16 @@ impl HttpDownloadClient {
                     url
                 );
 
-                // Make request with Range header
-                let response = client
+                // Make request with Range header and optional peer ID
+                let mut request = client
                     .get(&url)
-                    .header("Range", format!("bytes={}-{}", start, end))
-                    .send()
-                    .await
-                    .map_err(|e| format!("Failed to download chunk {}: {}", index, e))?;
+                    .header("Range", format!("bytes={}-{}", start, end));
+                
+                if let Some(ref peer_id) = downloader_peer_id {
+                    request = request.header("X-Downloader-Peer-ID", peer_id);
+                }
+                
+                let response = request.send().await.map_err(|e| format!("Failed to download chunk {}: {}", index, e))?;
 
                 // Verify 206 Partial Content response
                 if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
@@ -423,21 +460,36 @@ impl HttpDownloadClient {
         chunks: &[Vec<u8>],
         output_path: &Path,
     ) -> Result<(), String> {
+        // Ensure parent directory exists
+        if let Some(parent) = output_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("Failed to create parent directory: {}", e))?;
+        }
+
+        tracing::info!("Creating output file: {}", output_path.display());
+
         let mut file = File::create(output_path)
             .await
-            .map_err(|e| format!("Failed to create output file: {}", e))?;
+            .map_err(|e| format!("Failed to create output file at {}: {}", output_path.display(), e))?;
+
+        tracing::info!("Writing {} chunks to file...", chunks.len());
 
         for (index, chunk) in chunks.iter().enumerate() {
             file.write_all(chunk)
                 .await
-                .map_err(|e| format!("Failed to write chunk {}: {}", index, e))?;
+                .map_err(|e| format!("Failed to write chunk {} to {}: {}", index, output_path.display(), e))?;
         }
 
         file.flush()
             .await
-            .map_err(|e| format!("Failed to flush file: {}", e))?;
+            .map_err(|e| format!("Failed to flush file {}: {}", output_path.display(), e))?;
 
-        tracing::info!("Assembled file: {} ({} chunks)", output_path.display(), chunks.len());
+        tracing::info!("Successfully assembled file: {} ({} chunks, {} bytes)", 
+            output_path.display(), 
+            chunks.len(),
+            chunks.iter().map(|c| c.len()).sum::<usize>()
+        );
 
         Ok(())
     }
